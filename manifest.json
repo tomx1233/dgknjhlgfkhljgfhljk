@@ -1,0 +1,113 @@
+{
+  "manifest_version": 3,
+  "name": "K̸I̸L̵L̴A̸",
+  "version": "2.4.0",
+  "description": "Mass audio upload & asset management for the Roblox Creator Dashboard, an asset watchdog that auto-archives moderated uploads, one-click Roblox releases on DistroKid, and MRA, which fills in Roblox's own report form for a Creator Store asset. Brought to you by K̸I̸ḶL̶A̸.",
+  "permissions": [
+    "cookies",
+    "activeTab",
+    "storage",
+    "alarms",
+    "scripting"
+  ],
+  "action": {
+    "default_title": "KILLA - Asset Watchdog"
+  },
+  "host_permissions": [
+    "https://*/*",
+    "http://127.0.0.1/*",
+    "*://*.roblox.com/*",
+    "*://create.roblox.com/*",
+    "*://distrokid.com/*",
+    "*://*.distrokid.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://create.roblox.com/dashboard/creations*",
+        "*://create.roblox.com/dashboard/assets*",
+        "*://create.roblox.com/*/assets*"
+      ],
+      "js": [
+        "mainHook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://create.roblox.com/dashboard/creations*",
+        "*://create.roblox.com/dashboard/assets*",
+        "*://create.roblox.com/*/assets*",
+        "*://www.roblox.com/users/inventory*",
+        "*://www.roblox.com/users/*/inventory*",
+        "*://roblox.com/users/inventory*",
+        "*://roblox.com/users/*/inventory*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://distrokid.com/new/*",
+        "*://distrokid.com/new",
+        "*://*.distrokid.com/new/*",
+        "*://*.distrokid.com/new"
+      ],
+      "js": [
+        "distrokid.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://create.roblox.com/store/asset/*"
+      ],
+      "js": [
+        "reportTypes.js",
+        "reportHelper.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://www.roblox.com/report-abuse*",
+        "*://roblox.com/report-abuse*",
+        "*://*.roblox.com/report-abuse*"
+      ],
+      "js": [
+        "reportTypes.js",
+        "reportPrefill.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icons/*"
+      ],
+      "matches": [
+        "*://create.roblox.com/*"
+      ]
+    },
+    {
+      "resources": [
+        "assets/*"
+      ],
+      "matches": [
+        "*://distrokid.com/*",
+        "*://*.distrokid.com/*"
+      ]
+    }
+  ]
+}

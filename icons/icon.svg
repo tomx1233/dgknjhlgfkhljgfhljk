@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0a0a"/>
+      <stop offset="50%" stop-color="#1a0000"/>
+      <stop offset="100%" stop-color="#0a0a0a"/>
+    </linearGradient>
+    <linearGradient id="text" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff0033"/>
+      <stop offset="100%" stop-color="#ff6633"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="16" fill="url(#bg)" stroke="#ff0033" stroke-width="3"/>
+  <text x="64" y="82" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="36" fill="url(#text)" letter-spacing="6">KILLA</text>
+  <line x1="10" y1="4" x2="118" y2="4" stroke="#ff0033" stroke-width="2" opacity="0.6"/>
+</svg>

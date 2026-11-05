@@ -1,19 +1,17 @@
 // ============================================
 // K̸I̸L̵L̴A̸ — Shared report-reason table
 // ============================================
-// Single source of truth for MRA, loaded by both reportHelper.js (the
-// asset-page button) and reportPrefill.js (the report page) so the two can
-// never drift apart.
+// Single source of truth for MRA, loaded by reportHelper.js (the asset-page
+// button and the submitter behind it).
 //
 // `label`      — what the KILLA modal shows (the wording on Roblox's own
 //                category list, minus its casing differences).
 // `robloxLabel`— the exact string Roblox's report form renders for that
-//                category, read off its report web platform build.
-// `keyword`    — last-resort matcher if the form's rendered text shifts.
+//                category, read off its report web platform build. This is
+//                the value the report body must carry as the category.
+// `keyword`    — loose matcher kept for diagnostics/logging.
 //
-// These are Roblox's ten asset abuse categories, not a KILLA invention: the
-// helper selects one of them inside Roblox's own form, it does not file
-// anything by itself.
+// These are Roblox's ten asset abuse categories, not a KILLA invention.
 // ============================================
 
 (function () {
@@ -96,11 +94,43 @@
             .trim();
     }
 
+    // Roblox's asset-type names keyed by asset type id. The report API wants
+    // the type NAME as the reported abuse vector, and Roblox's web build keeps
+    // this table client-side (there is no endpoint that returns it), so it is
+    // mirrored here verbatim.
+    const ASSET_TYPE_NAMES = {
+        '1': 'image',
+        '3': 'audio',
+        '10': 'model',
+        '13': 'decal',
+        '24': 'animation',
+        '38': 'plugin',
+        '40': 'meshpart',
+        '62': 'video',
+        '73': 'fontfamily',
+        '300': 'music',
+        '301': 'soundeffect',
+        '302': 'unknownaudio',
+        '1001': 'package',
+        '1002': 'sharedpackage',
+    };
+
+    // Where a report is actually filed. `v2` is the endpoint Roblox's current
+    // report form posts an asset report to; `legacyAsset` is the older web
+    // platform endpoint it falls back to. Both are tried — see the submitter
+    // in reportHelper.js.
+    const REPORT_ENDPOINTS = {
+        v2: 'https://apis.roblox.com/abuse-reporting/v2/abuse-report',
+        legacyAsset: 'https://www.roblox.com/abusereport/api/asset',
+    };
+
     window.KILLA_REPORT_TYPES = {
         ABUSE_TYPES: ABUSE_TYPES,
         STORAGE_KEY: 'killaPendingReport',
         PENDING_TTL_MS: 10 * 60 * 1000,
         REPORT_URL: 'https://www.roblox.com/report-abuse/',
+        REPORT_ENDPOINTS: REPORT_ENDPOINTS,
+        ASSET_TYPE_NAMES: ASSET_TYPE_NAMES,
         normalize: normalize,
         byId: function (id) {
             const want = String(id);
@@ -108,6 +138,10 @@
                 if (String(ABUSE_TYPES[i].id) === want) return ABUSE_TYPES[i];
             }
             return null;
+        },
+        assetTypeName: function (typeId) {
+            if (typeId === undefined || typeId === null || typeId === '') return '';
+            return ASSET_TYPE_NAMES[String(typeId)] || '';
         },
     };
 })();

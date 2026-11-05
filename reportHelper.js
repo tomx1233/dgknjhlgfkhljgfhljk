@@ -6,9 +6,9 @@
 // next to the Download button.
 //
 // The button opens a small modal: pick ONE report reason, optionally write a
-// comment, then Submit. Submit hands off to Roblox's own report-abuse page
-// with the category and comment pre-filled; the report is reviewed and filed
-// by Roblox's own form, by hand. This script never submits a report itself.
+// comment, then Submit. Submit files the report itself — the same request
+// Roblox's own report form posts — and then refreshes the page. No new tab,
+// no autofill, no manual second click.
 // ============================================
 
 (function () {
@@ -106,6 +106,7 @@
         line-height: 1.4; color: rgb(188, 190, 200);
     }
     .killa-rh-status--error { color: #f87171; }
+    .killa-rh-status--ok { color: #6ee7a8; }
     `;
 
     let styleEl = null;
@@ -168,7 +169,7 @@
         btn.id = BUTTON_ID;
         btn.type = 'button';
         btn.className = 'killa-rh-btn';
-        btn.title = 'Report this asset';
+        btn.title = 'File a Roblox report for this asset';
         const ico = document.createElement('span');
         ico.className = 'killa-rh-ico';
         const txt = document.createElement('span');
@@ -203,9 +204,9 @@
     // ---------------------------------------------------------------
     // Asset type
     // ---------------------------------------------------------------
-    // Roblox's report form wants the asset type in its `custom` param. The
-    // store page resolves it from the same toolbox details endpoint used
-    // here, so the value matches what the site itself would put in the link.
+    // The report body has to name the asset's type (see buildSubmitBody). The
+    // store page resolves it from the same toolbox details endpoint used here,
+    // so the value matches what the site itself would send.
     function proxiedFetch(url) {
         return new Promise((resolve) => {
             try {
@@ -238,14 +239,150 @@
         }
     }
 
-    // Mirrors the URL the site builds for a store asset:
-    //   /report-abuse?abuseVector=asset&custom={"assetTypeId":"3"}&targetId=<id>
-    function buildReportUrl(assetId, typeId) {
-        const params = new URLSearchParams();
-        params.set('abuseVector', 'asset');
-        params.set('targetId', String(assetId));
-        if (typeId) params.set('custom', JSON.stringify({ assetTypeId: String(typeId) }));
-        return TYPES.REPORT_URL + '?' + params.toString();
+    // The report body is the one Roblox's own report form posts for an asset
+    // (abuse-report-ui `getReportBody`): the v2 endpoint takes the report as
+    // a map of report tags, and an asset's abuse vector is its asset TYPE
+    // NAME (audio, model, decal, …) rather than the literal "asset". The
+    // category is the abuse-category label exactly as the form renders it.
+    function buildSubmitBody(assetId, type, typeId, comment, userId) {
+        return {
+            ENTRY_POINT: { valueList: [{ data: 'website' }] },
+            REPORTED_ABUSE_CATEGORY: {
+                valueList: [{ data: TYPES.normalize(type.robloxLabel) }],
+            },
+            REPORTED_ABUSE_VECTOR: { valueList: [{ data: TYPES.assetTypeName(typeId) }] },
+            REPORTER_COMMENT: { valueList: [{ data: String(comment || '') }] },
+            SUBMITTER_USER_ID: { valueList: [{ data: String(userId) }] },
+            REPORT_TARGET_ASSET_ID: { valueList: [{ data: String(assetId) }] },
+        };
+    }
+
+    // ---------------------------------------------------------------
+    // Direct submit
+    // ---------------------------------------------------------------
+
+    function fetchAuthenticatedUserId() {
+        return new Promise((resolve) => {
+            try {
+                chrome.runtime.sendMessage(
+                    { type: 'killaFetch', url: 'https://users.roblox.com/v1/users/authenticated', method: 'GET', credentials: 'include' },
+                    (res) => {
+                        void chrome.runtime.lastError;
+                        if (!res || !res.ok) return resolve(null);
+                        try {
+                            const json = JSON.parse(res.body);
+                            resolve(json && json.id != null ? String(json.id) : null);
+                        } catch (_) {
+                            resolve(null);
+                        }
+                    }
+                );
+            } catch (_) {
+                resolve(null);
+            }
+        });
+    }
+
+    function postJson(url, body, csrf) {
+        return new Promise((resolve) => {
+            const headers = { 'Content-Type': 'application/json' };
+            if (csrf) headers['X-CSRF-Token'] = csrf;
+            try {
+                chrome.runtime.sendMessage(
+                    {
+                        type: 'killaFetch',
+                        url: url,
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: headers,
+                        bodyJson: body,
+                    },
+                    (res) => {
+                        void chrome.runtime.lastError;
+                        resolve(res || null);
+                    }
+                );
+            } catch (_) {
+                resolve(null);
+            }
+        });
+    }
+
+    // Roblox hands out an x-csrf-token on the 403 it returns to any
+    // cookie-bearing POST that lacks one — so probing is just "post
+    // something harmless, read the header". The report endpoint is probed
+    // first (an empty report is rejected outright, nothing is filed); the
+    // logout route is only a fallback, and it cannot succeed without a token
+    // either, so neither probe changes any state.
+    async function probeCsrfToken() {
+        const probe = await postJson(TYPES.REPORT_ENDPOINTS.v2, {}, null);
+        if (probe && probe.csrf) return probe.csrf;
+        const alt = await postJson('https://auth.roblox.com/v2/logout', {}, null);
+        return (alt && alt.csrf) || null;
+    }
+
+    function readJson(body) {
+        if (!body) return null;
+        try {
+            return JSON.parse(body);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // Pull a human sentence out of whatever the server returned so the modal
+    // can show why a report did not go through.
+    function serverMessage(res) {
+        if (!res) return 'no response from Roblox';
+        const json = readJson(res.body);
+        if (json) {
+            if (Array.isArray(json.errors) && json.errors.length) {
+                const first = json.errors[0];
+                if (first && first.message) return String(first.message);
+            }
+            if (typeof json.message === 'string' && json.message) return json.message;
+            if (typeof json.error === 'string' && json.error) return json.error;
+        }
+        const snippet = String(res.body || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+        return snippet || 'HTTP ' + (res.status === undefined ? '?' : res.status);
+    }
+
+    // POST the report, retrying once with the token from a 403 (CSRF
+    // rotation), then — only if the newer endpoint is missing/unsupported —
+    // once more against the older web-platform route.
+    async function postReport(body, opts, csrf) {
+        let token = csrf;
+        let last = null;
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            last = await postJson(TYPES.REPORT_ENDPOINTS.v2, body, token);
+            if (last && last.ok) return { ok: true, res: last };
+            if (last && last.status === 403 && last.csrf) {
+                token = last.csrf; // CSRF rotation — retry with the fresh token
+                continue;
+            }
+            break;
+        }
+
+        // The v2 body needs the asset type name; without it the report has no
+        // abuse vector, and 404/405 mean the v2 route isn't there for this
+        // account/build. Either way, fall through to the legacy route, which
+        // takes the flat payload the old report form used.
+        const noVector = !body.REPORTED_ABUSE_VECTOR.valueList[0].data;
+        if (noVector || (last && (last.status === 404 || last.status === 405))) {
+            const flat = {
+                Id: body.REPORT_TARGET_ASSET_ID.valueList[0].data,
+                Comment: body.REPORTER_COMMENT.valueList[0].data,
+                ReportCategory: opts.categoryId,
+                AssetTypeId: opts.typeId,
+                AssetType: body.REPORTED_ABUSE_VECTOR.valueList[0].data || 'asset',
+                RedirectUrl: 'https://create.roblox.com/',
+            };
+            const legacy = await postJson(TYPES.REPORT_ENDPOINTS.legacyAsset, flat, token || csrf);
+            if (legacy && legacy.ok) return { ok: true, res: legacy };
+            return { ok: false, res: legacy };
+        }
+        return { ok: false, res: last };
     }
 
     // ---------------------------------------------------------------
@@ -320,7 +457,7 @@
         const btnSubmit = document.createElement('button');
         btnSubmit.type = 'button';
         btnSubmit.className = 'killa-rh-btn-act';
-        btnSubmit.textContent = 'Open official report';
+        btnSubmit.textContent = 'Submit report';
 
         btnRow.appendChild(btnCancel);
         btnRow.appendChild(btnSubmit);
@@ -362,35 +499,57 @@
                 setStatus('Could not read the asset id from the URL.', true);
                 return;
             }
+            const type = TYPES.byId(picked.value);
+            if (!type) {
+                setStatus('That reason is not recognised \u2014 reload the page and try again.', true);
+                return;
+            }
+
             btnSubmit.disabled = true;
             btnCancel.disabled = true;
-            setStatus('Opening Roblox\u2019s report form\u2026');
+            setStatus('Submitting\u2026');
 
             const typeId = await resolveAssetTypeId(assetId);
-            const url = buildReportUrl(assetId, typeId);
+            const userId = await fetchAuthenticatedUserId();
+            if (!userId) {
+                btnSubmit.disabled = false;
+                btnCancel.disabled = false;
+                setStatus('Could not read your Roblox account \u2014 are you still signed in?', true);
+                return;
+            }
 
-            // Hand the choice across to the report page. It is keyed and TTL'd
-            // so a stale entry from a tab the user never finished cannot be
-            // applied to a later report.
-            const pending = {
-                assetId: assetId,
-                abuseTypeId: picked.value,
-                comment: comment.value.trim(),
-                ts: Date.now(),
-            };
-            await new Promise((resolve) => {
+            const body = buildSubmitBody(assetId, type, typeId, comment.value.trim(), userId);
+            let csrf = await probeCsrfToken();
+            let result = await postReport(body, { categoryId: String(type.id), typeId: typeId || '' }, csrf);
+            // A 403 carrying a token means the token rotated between the probe
+            // and the submit; take the new one and go again, once.
+            if (!result.ok && result.res && result.res.status === 403 && result.res.csrf) {
+                csrf = result.res.csrf;
+                result = await postReport(body, { categoryId: String(type.id), typeId: typeId || '' }, csrf);
+            }
+
+            if (!result.ok) {
+                btnSubmit.disabled = false;
+                btnCancel.disabled = false;
+                const reason = serverMessage(result.res);
+                setStatus('Report was not filed \u2014 ' + reason, true);
+                console.warn('[KILLA] MRA submit failed for asset ' + assetId + ':', result.res);
+                return;
+            }
+
+            // Filed. Report id is whatever the server echoed back, if anything.
+            const json = readJson(result.res && result.res.body);
+            const reportId = json && (json.reportId || json.id);
+            setStatus('Report submitted' + (reportId ? ' (#' + reportId + ')' : '') + ' \u2014 refreshing\u2026');
+            status.className = 'killa-rh-status killa-rh-status--ok';
+            console.log('[KILLA] MRA report filed for asset ' + assetId + ':', json || result.res.body);
+
+            // Refresh once the submit has landed, so the page reflects it.
+            setTimeout(() => {
                 try {
-                    chrome.storage.local.set({ [TYPES.STORAGE_KEY]: pending }, () => {
-                        void chrome.runtime.lastError;
-                        resolve();
-                    });
-                } catch (_) {
-                    resolve();
-                }
-            });
-
-            window.open(url, '_blank', 'noopener');
-            close();
+                    window.location.reload();
+                } catch (_) { /* ignore */ }
+            }, 900);
         });
 
         radios[0].focus();

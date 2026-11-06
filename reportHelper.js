@@ -37,8 +37,8 @@
     const MAX_RETRIES_PER_SEND = 5;      // retries for a single send before giving up on it
     const SEND_GAP_MS = 3000;            // pause between consecutive reports
     const RETRY_BASE_MS = 3000;          // first backoff step
-    const MAX_RATE_LIMIT_MS = 2 * 60 * 1000; // longest single wait
-    const MAX_TOTAL_WAIT_MS = 10 * 60 * 1000; // total waiting budget per run
+    const MAX_RATE_LIMIT_MS = 10 * 1000; // longest single wait
+    const MAX_TOTAL_WAIT_MS = 2 * 60 * 1000; // total waiting budget per run
 
     const CSS = `
     .killa-rh-btn {
@@ -450,7 +450,7 @@
             ms = m ? parseInt(m[1], 10) * 1000
                 : RETRY_BASE_MS * Math.pow(2, Math.max(0, (attempt || 1) - 1));
         }
-        return Math.min(Math.max(ms, 2000), MAX_RATE_LIMIT_MS);
+        return Math.min(Math.max(ms, 1000), MAX_RATE_LIMIT_MS);
     }
 
     // Failures worth trying again: the report did not land and nothing about
@@ -623,7 +623,7 @@
         const waitNote = document.createElement('div');
         waitNote.className = 'killa-rh-wait';
         waitNote.textContent = 'Sent ' + Math.round(SEND_GAP_MS / 1000) + 's apart. If Roblox rate limits, ' +
-            'MRA waits (up to ' + Math.round(MAX_RATE_LIMIT_MS / 60000) + ' min at a time) and carries on ' +
+            'MRA waits (up to ' + Math.round(MAX_RATE_LIMIT_MS / 1000) + 's at a time) and carries on ' +
             'until the count is reached.';
         dialog.appendChild(waitNote);
 
@@ -785,7 +785,7 @@
                     ? result.sent + ' of ' + count + ' sent, then stopped'
                     : 'Nothing was sent';
                 const tail = result.budgetOut
-                    ? ' \u2014 still rate limited (waited ' + Math.round(MAX_TOTAL_WAIT_MS / 60000) + ' min)'
+                    ? ' \u2014 still rate limited (waited ' + Math.round(MAX_TOTAL_WAIT_MS / 60000) + ' min in total)'
                     : result.fatal
                         ? ' \u2014 ' + reason
                         : ' \u2014 ' + reason + ' (retries exhausted)';

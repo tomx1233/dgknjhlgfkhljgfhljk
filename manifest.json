@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "K̸I̸L̵L̴A̸",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "description": "Mass audio upload & asset management for the Roblox Creator Dashboard, an asset watchdog that auto-archives moderated uploads, one-click Roblox releases on DistroKid, and MRA, which files a Roblox report for a Creator Store asset in one click. Brought to you by K̸I̸ḶL̶A̸.",
   "permissions": [
     "cookies",

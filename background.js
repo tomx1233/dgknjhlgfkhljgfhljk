@@ -70,6 +70,7 @@ async function killaProxiedFetch(msg) {
             status: res.status,
             body: body,
             csrf: res.headers.get('x-csrf-token'),
+            retryAfter: res.headers.get('retry-after'),
             etag: res.headers.get('ETag'),
         };
     } catch (err) {

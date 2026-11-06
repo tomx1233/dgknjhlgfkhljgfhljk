@@ -10,10 +10,9 @@
 // Roblox's own report form posts — and then refreshes the page. No new tab,
 // no autofill, no manual second click.
 //
-// Delivery is exactly one report. If the request does not land (rate limit,
-// network drop, rotated session) the SAME report is retried with backoff
-// until it is accepted; a report that already landed is never re-sent, so
-// retries cannot become duplicate reports.
+// Delivery is a count: the modal's "Times to send" decides how many reports
+// go out. They are paced, and a rate limit only pauses the run — it waits and
+// then continues until the count is reached.
 // ============================================
 
 (function () {
@@ -29,14 +28,17 @@
 
     const BUTTON_ID = 'killa-report-helper-btn';
     const OVERLAY_CLASS = 'killa-rh-overlay';
-    const RETRY_ID = 'killa-rh-retry';
+    const REPEAT_ID = 'killa-rh-repeat';
 
-    // One report per submit. Retries exist only to get *that one* report
-    // through — never to send it twice — so these bound the retry ladder,
-    // not a repeat count.
-    const MAX_SEND_ATTEMPTS = 5;
-    const RETRY_BASE_MS = 3000;              // first backoff step
+    // `count` reports are sent per submit, one after another. These bound how
+    // hard a single run can push and how long a rate limit can hold it:
+    // a run stops only when the count is reached or a retry budget runs out.
+    const MAX_REPEATS = 10;              // most reports one run will ever send
+    const MAX_RETRIES_PER_SEND = 5;      // retries for a single send before giving up on it
+    const SEND_GAP_MS = 3000;            // pause between consecutive reports
+    const RETRY_BASE_MS = 3000;          // first backoff step
     const MAX_RATE_LIMIT_MS = 2 * 60 * 1000; // longest single wait
+    const MAX_TOTAL_WAIT_MS = 10 * 60 * 1000; // total waiting budget per run
 
     const CSS = `
     .killa-rh-btn {
@@ -98,17 +100,20 @@
         outline: none; margin-bottom: 16px;
     }
     .killa-rh-text:focus { border-color: rgba(208, 217, 251, .5); }
-    .killa-rh-retry {
-        display: flex; align-items: center; gap: 9px;
+    .killa-rh-repeat {
+        display: flex; align-items: center; gap: 10px;
         margin: 0 0 8px 0; padding-top: 14px;
         border-top: 1px solid rgba(208, 217, 251, .12);
-        font-size: 13px; color: rgb(247, 247, 248); cursor: pointer;
-        user-select: none;
+        font-size: 13px; color: rgb(188, 190, 200);
     }
-    .killa-rh-retry input {
-        margin: 0; flex: 0 0 auto; accent-color: rgb(63, 74, 150);
-        width: 16px; height: 16px; cursor: pointer;
+    .killa-rh-repeat input[type="number"] {
+        box-sizing: border-box; width: 68px; padding: 7px 9px;
+        border-radius: 8px; font: inherit; font-weight: 700;
+        color: rgb(247, 247, 248); text-align: center;
+        border: 1px solid rgba(208, 217, 251, .2);
+        background: rgba(208, 217, 251, .08); outline: none;
     }
+    .killa-rh-repeat input[type="number"]:focus { border-color: rgba(208, 217, 251, .5); }
     .killa-rh-wait {
         margin: -8px 0 14px 0; font-size: 12px; line-height: 1.45;
         color: rgb(188, 190, 200);
@@ -462,48 +467,75 @@
         return false;
     }
 
-    // Files ONE report and keeps trying only until it is accepted, then
-    // stops. It never re-sends a report that already landed, so retries
-    // cannot turn into duplicate reports.
+    // Sends `count` reports of the same asset, one at a time. Each send keeps
+    // retrying while it is rate limited and continues with the rest of the
+    // count once it lands — so the run only finishes early when the count is
+    // reached, a retry budget runs out, or Roblox rejects the request outright.
     //
     // `onProgress(state)` is called with:
-    //   { phase: 'sending' | 'waiting' | 'done' | 'failed',
-    //     attempt, maxAttempts, waitMs, res }
-    async function submitWithRetry(buildBody, opts, onProgress, maxAttempts) {
-        const limit = Math.max(1, Math.min(maxAttempts || MAX_SEND_ATTEMPTS, MAX_SEND_ATTEMPTS));
+    //   { phase: 'sending' | 'waiting' | 'sent' | 'failed' | 'done' | 'stopped',
+    //     sent, count, attempt, maxAttempts, waitMs, res }
+    async function sendCount(buildBody, opts, count, onProgress) {
+        const total = Math.max(1, Math.min(count || 1, MAX_REPEATS));
         let csrf = await probeCsrfToken();
+        let sent = 0;
+        let waitedMs = 0;
         let last = null;
 
-        for (let attempt = 1; attempt <= limit; attempt++) {
-            onProgress({ phase: 'sending', attempt: attempt, maxAttempts: limit });
+        for (let i = 0; i < total; i++) {
+            if (i > 0) await sleep(SEND_GAP_MS);
 
-            last = await postReport(buildBody(), opts, csrf);
-            if (last.ok) {
-                onProgress({ phase: 'done', attempt: attempt, maxAttempts: limit, res: last.res });
-                return { ok: true, attempts: attempt, res: last.res };
+            let delivered = false;
+            for (let attempt = 1; attempt <= MAX_RETRIES_PER_SEND; attempt++) {
+                onProgress({ phase: 'sending', sent: sent, count: total, attempt: attempt, maxAttempts: MAX_RETRIES_PER_SEND });
+
+                last = await postReport(buildBody(), opts, csrf);
+                if (last.ok) {
+                    delivered = true;
+                    break;
+                }
+
+                const res = last.res;
+                if (res && res.csrf) csrf = res.csrf;
+
+                // A rejection that repeating cannot fix: stop the whole run
+                // and hand the reason back instead of burning the count.
+                if (!isRetriable(res)) {
+                    onProgress({ phase: 'failed', sent: sent, count: total, attempt: attempt, maxAttempts: MAX_RETRIES_PER_SEND, res: res });
+                    return { ok: false, sent: sent, res: res, fatal: true };
+                }
+
+                if (attempt === MAX_RETRIES_PER_SEND) break;
+
+                // Rate limited (or otherwise transient): wait it out, then
+                // carry on with this same send.
+                const waitMs = res && res.status === 429
+                    ? rateLimitWaitMs(res, attempt)
+                    : Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), MAX_RATE_LIMIT_MS);
+
+                if (waitedMs + waitMs > MAX_TOTAL_WAIT_MS) {
+                    onProgress({ phase: 'stopped', sent: sent, count: total, attempt: attempt, maxAttempts: MAX_RETRIES_PER_SEND, waitMs: 0, res: res, budgetOut: true });
+                    return { ok: false, sent: sent, res: res, fatal: false, budgetOut: true };
+                }
+
+                waitedMs += waitMs;
+                onProgress({ phase: 'waiting', sent: sent, count: total, attempt: attempt, maxAttempts: MAX_RETRIES_PER_SEND, waitMs: waitMs, res: res });
+                await sleep(waitMs);
             }
 
-            const res = last.res;
-            if (res && res.csrf) csrf = res.csrf;
-
-            if (!isRetriable(res)) {
-                onProgress({ phase: 'failed', attempt: attempt, maxAttempts: limit, res: res });
-                return { ok: false, attempts: attempt, res: res, gaveUp: false };
+            if (!delivered) {
+                // Retries for this one send are exhausted; the rest of the
+                // count could still go through, so keep going.
+                onProgress({ phase: 'stopped', sent: sent, count: total, attempt: MAX_RETRIES_PER_SEND, maxAttempts: MAX_RETRIES_PER_SEND, res: last && last.res, skipped: true });
+                continue;
             }
 
-            if (attempt === limit) break;
-
-            const waitMs = res && res.status === 429
-                ? rateLimitWaitMs(res, attempt)
-                : Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), MAX_RATE_LIMIT_MS);
-
-            // The wait budget is a courtesy ceiling, not a per-attempt one.
-            onProgress({ phase: 'waiting', attempt: attempt, maxAttempts: limit, waitMs: waitMs, res: res });
-            await sleep(waitMs);
+            sent++;
+            onProgress({ phase: 'sent', sent: sent, count: total, res: last && last.res });
         }
 
-        onProgress({ phase: 'failed', attempt: limit, maxAttempts: limit, res: last && last.res });
-        return { ok: false, attempts: limit, res: last && last.res, gaveUp: true };
+        onProgress({ phase: 'done', sent: sent, count: total, res: last && last.res });
+        return { ok: sent >= total, sent: sent, res: last && last.res };
     }
 
     // ---------------------------------------------------------------
@@ -565,26 +597,34 @@
         comment.placeholder = 'Anything you want the reviewer to know (optional)';
         dialog.appendChild(comment);
 
-        // Delivery options. A report is filed once; the only thing that gets
-        // retried is a report that did NOT land, so this is a switch rather
-        // than a number of copies.
-        const retryRow = document.createElement('label');
-        retryRow.className = 'killa-rh-retry';
-        const retryBox = document.createElement('input');
-        retryBox.type = 'checkbox';
-        retryBox.id = RETRY_ID;
-        retryBox.checked = true;
-        const retryText = document.createElement('span');
-        retryText.textContent = 'Retry if it doesn\u2019t go through';
-        retryRow.appendChild(retryBox);
-        retryRow.appendChild(retryText);
-        dialog.appendChild(retryRow);
+        // Times to send. Each send is paced, and a rate limit only pauses the
+        // run — it keeps going until the count is reached.
+        const repeatRow = document.createElement('div');
+        repeatRow.className = 'killa-rh-repeat';
+        const repeatLabel = document.createElement('label');
+        repeatLabel.setAttribute('for', REPEAT_ID);
+        repeatLabel.textContent = 'Times to send';
+        const repeat = document.createElement('input');
+        repeat.id = REPEAT_ID;
+        repeat.type = 'number';
+        repeat.min = '1';
+        repeat.max = String(MAX_REPEATS);
+        repeat.step = '1';
+        repeat.value = '1';
+        repeat.setAttribute('inputmode', 'numeric');
+        const repeatHint = document.createElement('span');
+        repeatHint.textContent = 'max ' + MAX_REPEATS;
+        repeatRow.appendChild(repeatLabel);
+        repeatRow.appendChild(repeat);
+        repeatRow.appendChild(repeatHint);
+        dialog.appendChild(repeatRow);
 
         // Standing explanation, so a wait later on isn't a surprise.
         const waitNote = document.createElement('div');
         waitNote.className = 'killa-rh-wait';
-        waitNote.textContent = 'One report per submit. If Roblox rate limits or the send fails, ' +
-            'MRA waits it out and retries the same report \u2014 it never sends a second copy.';
+        waitNote.textContent = 'Sent ' + Math.round(SEND_GAP_MS / 1000) + 's apart. If Roblox rate limits, ' +
+            'MRA waits (up to ' + Math.round(MAX_RATE_LIMIT_MS / 60000) + ' min at a time) and carries on ' +
+            'until the count is reached.';
         dialog.appendChild(waitNote);
 
         const btnRow = document.createElement('div');
@@ -624,7 +664,7 @@
         function unlock() {
             btnSubmit.disabled = false;
             btnCancel.disabled = false;
-            retryBox.disabled = false;
+            repeat.disabled = false;
         }
 
         function onKeyDown(e) {
@@ -656,10 +696,16 @@
                 return;
             }
 
+            // Clamp whatever was typed: 1..MAX_REPEATS, whole numbers only.
+            let count = parseInt(repeat.value, 10);
+            if (Number.isNaN(count) || count < 1) count = 1;
+            count = Math.min(count, MAX_REPEATS);
+            repeat.value = String(count);
+
             btnSubmit.disabled = true;
             btnCancel.disabled = true;
-            retryBox.disabled = true;
-            setStatus('Submitting\u2026');
+            repeat.disabled = true;
+            setStatus(count > 1 ? 'Sending 0 / ' + count + '\u2026' : 'Submitting\u2026');
 
             const typeId = await resolveAssetTypeId(assetId);
             const userId = await fetchAuthenticatedUserId();
@@ -672,8 +718,8 @@
             const text = comment.value.trim();
             const opts = { categoryId: String(type.id), typeId: typeId || '' };
 
-            // Live countdown for a backoff wait, kept out of the engine so the
-            // modal shows how long is left instead of going quiet.
+            // Live countdown for a rate-limit wait, kept out of the engine so
+            // the modal shows how long is left instead of going quiet.
             let countdown = null;
             const stopCountdown = () => {
                 if (countdown) clearInterval(countdown);
@@ -682,64 +728,83 @@
 
             const onProgress = (state) => {
                 stopCountdown();
+                const of = state.count > 1 ? ' (' + state.sent + ' / ' + state.count + ' sent)' : '';
+
                 if (state.phase === 'sending') {
-                    setStatus(
-                        state.maxAttempts > 1 && state.attempt > 1
-                            ? 'Retrying \u2014 attempt ' + state.attempt + ' of ' + state.maxAttempts + '\u2026'
-                            : 'Submitting\u2026'
-                    );
+                    if (state.attempt > 1) {
+                        setStatus('Retrying' + of + ' \u2014 attempt ' + state.attempt + ' of ' + state.maxAttempts + '\u2026');
+                    } else {
+                        setStatus(state.count > 1 ? 'Sending ' + (state.sent + 1) + ' / ' + state.count + '\u2026' : 'Submitting\u2026');
+                    }
                     return;
                 }
-                if (state.phase !== 'waiting') return;
 
-                const limited = state.res && state.res.status === 429;
-                let ms = state.waitMs;
-                const paint = () => {
-                    const secs = Math.max(0, Math.ceil(ms / 1000));
-                    setStatus(
-                        (limited ? 'Rate limited' : 'No response') +
-                        ' \u2014 waiting ' + secs + 's, then retrying the same report' +
-                        ' (attempt ' + (state.attempt + 1) + ' of ' + state.maxAttempts + ')\u2026'
-                    );
-                };
-                paint();
-                countdown = setInterval(() => {
-                    ms -= 1000;
-                    if (ms <= 0) { stopCountdown(); return; }
+                if (state.phase === 'waiting') {
+                    const limited = state.res && state.res.status === 429;
+                    let ms = state.waitMs;
+                    const paint = () => {
+                        const secs = Math.max(0, Math.ceil(ms / 1000));
+                        setStatus(
+                            (limited ? 'Rate limited' : 'No response') + ' \u2014 waiting ' + secs + 's,' +
+                            ' then continuing' + of + '\u2026'
+                        );
+                    };
                     paint();
-                }, 1000);
+                    countdown = setInterval(() => {
+                        ms -= 1000;
+                        if (ms <= 0) { stopCountdown(); return; }
+                        paint();
+                    }, 1000);
+                    return;
+                }
+
+                if (state.phase === 'sent') {
+                    setStatus('Sent ' + state.sent + ' / ' + state.count + '\u2026');
+                }
+
+                if (state.phase === 'stopped') {
+                    setStatus(
+                        'Sent ' + state.sent + ' / ' + state.count +
+                        ' \u2014 one send did not go through, continuing\u2026', true
+                    );
+                }
             };
 
-            // With retries switched off, the ladder is a single attempt.
-            const result = await submitWithRetry(
+            const result = await sendCount(
                 () => buildSubmitBody(assetId, type, typeId, text, userId),
                 opts,
-                retryBox.checked ? onProgress : () => {},
-                retryBox.checked ? MAX_SEND_ATTEMPTS : 1
+                count,
+                onProgress
             );
             stopCountdown();
 
             if (!result.ok) {
                 unlock();
                 const reason = serverMessage(result.res);
-                const tries = result.attempts > 1 ? ' (gave up after ' + result.attempts + ' attempts)' : '';
-                setStatus('Report was not filed \u2014 ' + reason + tries, true);
-                console.warn('[KILLA] MRA submit failed for asset ' + assetId + ':', result);
+                const head = result.sent
+                    ? result.sent + ' of ' + count + ' sent, then stopped'
+                    : 'Nothing was sent';
+                const tail = result.budgetOut
+                    ? ' \u2014 still rate limited (waited ' + Math.round(MAX_TOTAL_WAIT_MS / 60000) + ' min)'
+                    : result.fatal
+                        ? ' \u2014 ' + reason
+                        : ' \u2014 ' + reason + ' (retries exhausted)';
+                setStatus(head + tail, true);
+                console.warn('[KILLA] MRA run stopped for asset ' + assetId + ':', result);
                 return;
             }
 
             const json = readJson(result.res && result.res.body);
             const reportId = json && (json.reportId || json.id);
             setStatus(
-                'Report submitted' +
-                (reportId ? ' (#' + reportId + ')' : '') +
-                (result.attempts > 1 ? ' after ' + result.attempts + ' attempts' : '') +
+                (count > 1 ? 'Sent ' + count + ' reports' : 'Report submitted') +
+                (reportId && count === 1 ? ' (#' + reportId + ')' : '') +
                 ' \u2014 refreshing\u2026'
             );
             status.className = 'killa-rh-status killa-rh-status--ok';
-            console.log('[KILLA] MRA filed report for asset ' + assetId + ':', result.res && result.res.body);
+            console.log('[KILLA] MRA sent ' + result.sent + ' report(s) for asset ' + assetId + ':', result.res && result.res.body);
 
-            // Refresh once the report has landed.
+            // Refresh once the run is finished.
             setTimeout(() => {
                 try {
                     window.location.reload();
